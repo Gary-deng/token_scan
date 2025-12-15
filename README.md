@@ -1,7 +1,10 @@
 # token_scan
-Scan potential token from Binance and OKX 
-表格取自币安现货、有USDT作为交易对的币种
-close：日线收盘价，因为币安在早上8点（UTC+8）收日线，没到8点之前显示的都是前一天的收盘价
+Scan potential token from Binance and OKX \
+
+表格取自币安现货、有USDT作为交易对的币种\
+
+close：日线收盘价，因为币安在早上8点（UTC+8）收日线，没到8点之前显示的都是前一天的收盘价\
+
 above_ma7/30/100：日线收盘价是否超过7/30/100日均线
 valid_above_ma7/30/100：日线收盘价是否连续两天超过7/30/100日均线，改指标的目的是为了筛选掉假突破
 rvol：过去24h交易量相比过去N天（不包括当天）的平均交易量的比值，我这设置的N=20
