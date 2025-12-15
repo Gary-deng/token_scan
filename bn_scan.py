@@ -2,35 +2,67 @@
 # -*- coding: utf-8 -*-
 
 """
-Binance Spot (USDT quote) 全量扫描：
+Binance Spot (USDT quote) 全量扫描（支持多 base endpoint 兜底）：
+
 - 永远不跳过交易对：任何错误/数据不足都输出一行，并标记 status/note
 - MA7/30/100：数据不够则对应字段为缺失（None/NaN），但仍计算可计算的 MA
 - 有效站上：连续2天“已收盘日线”收盘价 > 当天MA（MA缺失则有效站上=缺失）
 - 放量：RVOL = 今日量 / 前N日均量（不含今日）；数据不够则缺失
 - 24h quoteVolume 用于排序（只对 USDT quote 有意义）
-- 429/418：按 Retry-After 退避重试，并在结果中标记 RATE_LIMITED（最终失败）或 OK（成功）
+- 429/418：按 Retry-After 退避重试；451：快速失败并切换 base endpoint
+- 多 base endpoint：自动尝试
+    https://api-gcp.binance.com
+    https://api.binance.com
+    https://api1.binance.com
+    https://api2.binance.com
+    https://api3.binance.com
+    https://api4.binance.com
 
-相关端点说明：
-- /api/v3/exchangeInfo 支持 permissions=SPOT、symbolStatus 等筛选 :contentReference[oaicite:1]{index=1}
-- /api/v3/klines limit 最大 1000（默认 500）:contentReference[oaicite:2]{index=2}
-- 429/418 要 backoff，且会给 Retry-After :contentReference[oaicite:3]{index=3}
+可选环境变量：
+- BINANCE_BASE_URLS: 逗号分隔，覆盖/追加 base endpoint 优先顺序
+  例：BINANCE_BASE_URLS="https://api-gcp.binance.com,https://api.binance.com"
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import pandas as pd
+import requests
 
 
-BASE_URL = "https://api.binance.com"
 PATH_EXCHANGE_INFO = "/api/v3/exchangeInfo"
 PATH_TICKER_24HR = "/api/v3/ticker/24hr"
 PATH_KLINES = "/api/v3/klines"
+
+
+# ---- multi-base endpoints ----
+DEFAULT_BINANCE_BASE_URLS: List[str] = [
+    "https://api-gcp.binance.com",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+
+
+def get_binance_base_urls() -> List[str]:
+    env = os.environ.get("BINANCE_BASE_URLS", "").strip()
+    env_list = [x.strip() for x in env.split(",") if x.strip()]
+    merged = env_list + DEFAULT_BINANCE_BASE_URLS
+
+    seen = set()
+    out: List[str] = []
+    for u in merged:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u.rstrip("/"))
+    return out
 
 
 @dataclass
@@ -86,12 +118,18 @@ def request_json_with_retry(
     status: OK / RATE_LIMITED / HTTP_ERROR / PARSE_ERROR
     note:   详细原因
 
-    429/418：读取 Retry-After 秒数退避；没有就指数退避。:contentReference[oaicite:4]{index=4}
+    429/418：读取 Retry-After 秒数退避；没有就指数退避。
+    451：快速返回 HTTP_ERROR（让外层切换 base endpoint）。
     """
     last_note = ""
     for attempt in range(1, max_retries + 1):
         try:
             resp = session.get(url, params=params, timeout=timeout)
+
+            # 451：切换 base endpoint（同域名重试意义不大）
+            if resp.status_code == 451:
+                return None, "HTTP_ERROR", f"HTTP 451 (Unavailable for Legal Reasons) at {url}"
+
             if resp.status_code in (429, 418):
                 retry_after = resp.headers.get("Retry-After")
                 wait_s = None
@@ -102,10 +140,12 @@ def request_json_with_retry(
                         wait_s = None
 
                 if wait_s is None:
-                    # fallback exponential backoff
                     wait_s = base_sleep * (2 ** (attempt - 1))
 
-                last_note = f"HTTP {resp.status_code} rate limited; Retry-After={retry_after}; wait {wait_s:.2f}s (attempt {attempt}/{max_retries})"
+                last_note = (
+                    f"HTTP {resp.status_code} rate limited; Retry-After={retry_after}; "
+                    f"wait {wait_s:.2f}s (attempt {attempt}/{max_retries})"
+                )
                 time.sleep(wait_s)
                 continue
 
@@ -134,23 +174,75 @@ def request_json_with_retry(
     return None, "RATE_LIMITED", last_note or "rate limited"
 
 
-def fetch_exchange_info_spot(session: requests.Session) -> Tuple[Optional[dict], str, str]:
-    # 使用 permissions=SPOT 来确保是现货；symbolStatus=TRADING 只要可交易。:contentReference[oaicite:5]{index=5}
-    url = BASE_URL + PATH_EXCHANGE_INFO
+class BinanceMultiBaseClient:
+    """
+    维护一个“当前可用 base_url”，失败时自动切换到下一个。
+    """
+    def __init__(self, session: requests.Session, base_urls: List[str]):
+        self.session = session
+        self.base_urls = base_urls[:] if base_urls else DEFAULT_BINANCE_BASE_URLS[:]
+        self.current_base: Optional[str] = None
+
+    def _iter_bases(self) -> List[str]:
+        if self.current_base and self.current_base in self.base_urls:
+            # 当前 base 优先，其余做 fallback
+            others = [b for b in self.base_urls if b != self.current_base]
+            return [self.current_base] + others
+        return self.base_urls
+
+    def get_json(
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        timeout: int = 15,
+        max_retries: int = 5,
+        base_sleep: float = 0.8,
+    ) -> Tuple[Optional[Any], str, str, str]:
+        """
+        返回 (json, status, note, used_base)
+        """
+        last_note = ""
+        last_status = "HTTP_ERROR"
+        used = ""
+
+        for base in self._iter_bases():
+            url = base + path
+            js, st, note = request_json_with_retry(
+                session=self.session,
+                url=url,
+                params=params,
+                timeout=timeout,
+                max_retries=max_retries,
+                base_sleep=base_sleep,
+            )
+
+            if st == "OK" and js is not None:
+                self.current_base = base
+                return js, "OK", "", base
+
+            # 记录失败原因，继续尝试下一个 base
+            last_status = st
+            last_note = (note or f"failed at {url}").strip()
+            used = base
+
+        return None, last_status, last_note, (used or "")
+
+
+def fetch_exchange_info_spot(client: BinanceMultiBaseClient) -> Tuple[Optional[dict], str, str]:
     params = {"permissions": "SPOT", "symbolStatus": "TRADING"}
-    return request_json_with_retry(session, url, params=params)
+    js, st, note, _ = client.get_json(PATH_EXCHANGE_INFO, params=params)
+    return js, st, note
 
 
-def fetch_all_tickers_24hr(session: requests.Session) -> Tuple[Optional[List[dict]], str, str]:
-    # 不带 symbol 会返回全市场数组（数据量大，注意 weight）。:contentReference[oaicite:6]{index=6}
-    url = BASE_URL + PATH_TICKER_24HR
-    return request_json_with_retry(session, url, params=None)
+def fetch_all_tickers_24hr(client: BinanceMultiBaseClient) -> Tuple[Optional[List[dict]], str, str]:
+    js, st, note, _ = client.get_json(PATH_TICKER_24HR, params=None)
+    return js, st, note
 
 
-def fetch_klines(session: requests.Session, symbol: str, interval: str, limit: int) -> Tuple[Optional[List[List[Any]]], str, str]:
-    url = BASE_URL + PATH_KLINES
+def fetch_klines(client: BinanceMultiBaseClient, symbol: str, interval: str, limit: int) -> Tuple[Optional[List[List[Any]]], str, str]:
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    return request_json_with_retry(session, url, params=params)
+    js, st, note, _ = client.get_json(PATH_KLINES, params=params)
+    return js, st, note
 
 
 def klines_to_df(klines: List[List[Any]]) -> pd.DataFrame:
@@ -257,7 +349,7 @@ def compute_indicators_partial(
         out["volume_spike"] = None
         return out
 
-    vols_prev_n = df.loc[i_last - vol_lookback : i_last - 1, "volume"]
+    vols_prev_n = df.loc[i_last - vol_lookback: i_last - 1, "volume"]
     vol_avg_n = safe_float(vols_prev_n.mean())
     if vol_avg_n is None or vol_avg_n <= 0:
         out["rvol"] = None
@@ -267,14 +359,14 @@ def compute_indicators_partial(
     rvol = vol_today / vol_avg_n
     out["rvol"] = float(rvol)
 
-    volume_spike = bool(rvol >= rvol_threshold)
+    volume_spike: Optional[bool] = bool(rvol >= rvol_threshold)
     if require_vol_gt_yesterday and prev_row is not None:
         vol_yesterday = safe_float(prev_row["volume"])
         if vol_yesterday is not None:
-            volume_spike = volume_spike and (vol_today > vol_yesterday)
+            volume_spike = bool(volume_spike and (vol_today > vol_yesterday))
         else:
             volume_spike = None  # 昨日量缺失就标缺失
-    out["volume_spike"] = volume_spike if volume_spike is None else bool(volume_spike)
+    out["volume_spike"] = volume_spike
     return out
 
 
@@ -291,10 +383,15 @@ def main():
     args = ap.parse_args()
 
     session = requests.Session()
+    base_urls = get_binance_base_urls()
+    client = BinanceMultiBaseClient(session=session, base_urls=base_urls)
 
-    ex, ex_status, ex_note = fetch_exchange_info_spot(session)
+    ex, ex_status, ex_note = fetch_exchange_info_spot(client)
     if ex_status != "OK" or not ex:
-        raise SystemExit(f"exchangeInfo failed: {ex_status} {ex_note}")
+        raise SystemExit(
+            f"exchangeInfo failed: {ex_status} {ex_note} "
+            f"(tried bases: {', '.join(base_urls)})"
+        )
 
     # 只保留 quoteAsset=USDT 的现货交易对
     symbol_to_base: Dict[str, str] = {}
@@ -315,7 +412,7 @@ def main():
         raise SystemExit(f"No TRADING SPOT symbols found for quote={args.quote}")
 
     # 24h ticker：拿 quoteVolume 排序（只对 USDT quote 可比）
-    tickers, t_status, t_note = fetch_all_tickers_24hr(session)
+    tickers, t_status, t_note = fetch_all_tickers_24hr(client)
     qv_map: Dict[str, float] = {sym: 0.0 for sym in symbols_all}
     if t_status == "OK" and isinstance(tickers, list):
         for t in tickers:
@@ -325,9 +422,6 @@ def main():
                     qv_map[sym] = float(t.get("quoteVolume", 0.0))
                 except Exception:
                     qv_map[sym] = 0.0
-    else:
-        # ticker 获取失败也不影响继续：全部 qv=0，并在 note 里提示
-        pass
 
     symbols_sorted = sorted(symbols_all, key=lambda s: qv_map.get(s, 0.0), reverse=True)
     if args.top and args.top > 0:
@@ -335,19 +429,22 @@ def main():
 
     rows: List[RowOut] = []
 
-    # 如果 ticker 总接口失败，给一个统一提醒
     global_ticker_note = ""
     if t_status != "OK":
         global_ticker_note = f"ticker/24hr failed: {t_status} {t_note}"
 
-    for idx, sym in enumerate(symbols_sorted, start=1):
+    for sym in symbols_sorted:
         base = symbol_to_base.get(sym, sym)
         quote = symbol_to_quote.get(sym, args.quote)
         qv = qv_map.get(sym, 0.0)
 
-        kl, k_status, k_note = fetch_klines(session, sym, interval="1d", limit=min(int(args.kline_limit), 1000))
+        kl, k_status, k_note = fetch_klines(
+            client,
+            sym,
+            interval="1d",
+            limit=min(int(args.kline_limit), 1000),
+        )
         if k_status != "OK" or not isinstance(kl, list):
-            # 429/HTTP错误：仍然输出一行，标记 status/note
             note = (k_note or "").strip()
             if global_ticker_note:
                 note = (note + " | " + global_ticker_note).strip(" |")
@@ -376,7 +473,6 @@ def main():
 
             status = "OK"
             note = ""
-            # 如果数据不足导致很多字段缺失，也给一个轻提示（但不算错误）
             if ind.get("bars_closed", 0) < 2:
                 status = "DATA_INSUFFICIENT"
                 note = "Not enough closed daily candles"
@@ -431,7 +527,6 @@ def main():
 
     df_out = pd.DataFrame([asdict(r) for r in rows])
 
-    # 输出列顺序：你要的“币种在第一列，后面 P>MA / 有效站上 / 放量”
     cols = [
         "coin",
         "symbol",
@@ -456,9 +551,7 @@ def main():
         if c not in df_out.columns:
             df_out[c] = None
 
-    # 按交易量降序；同量按 symbol
     df_out = df_out[cols].sort_values(by=["quote_volume_24h", "symbol"], ascending=[False, True])
-
     df_out.to_excel(args.out, index=False)
     print(f"Saved: {args.out}  rows={len(df_out)}")
 
